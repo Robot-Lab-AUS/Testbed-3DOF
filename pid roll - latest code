@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Roll-Only Bench Stabilizer (PCA9685 + ICM-20948)
-- Outer loop: roll angle P -> roll-rate setpoint
+- Outer loop: roll angle/rate PD -> roll-rate setpoint
 - Inner loop: roll-rate PID -> motor differential command
 - Complementary angle estimate (accel + gyro)
 - Startup ramp + settle + PID blend-in
@@ -157,48 +157,93 @@ MAX_US = 2000
 ARM_TIME_S = 3.0
 RUN_TIME_S = 100.0
 
-MAX_THROTTLE_PCT = 20.0
-DEFAULT_BASE_PCT = 7.0
+MAX_THROTTLE_PCT = 45.0
+DEFAULT_BASE_PCT = 35.0
+CONTROL_HEADROOM_PCT = 4.0
 
 # Throttle-aware scheduling for low-jitter hold at higher base speed.
 # At higher throttle, reduce loop aggressiveness and increase filtering/deadband.
-SCHED_THR_LOW_PCT = 10.0
-SCHED_THR_HIGH_PCT = 20.0
+SCHED_THR_LOW_PCT = 20.0
+SCHED_THR_HIGH_PCT = 42.0
 
 # Outer loop (angle -> rate setpoint), low->high throttle
-K_ANGLE_P_LOW = 6.5
-K_ANGLE_P_HIGH = 4.8
-ANGLE_DEADBAND_DEG_LOW = 0.45
-ANGLE_DEADBAND_DEG_HIGH = 1.25
-RATE_SP_MAX_DPS_LOW = 72.0
-RATE_SP_MAX_DPS_HIGH = 46.0
+K_ANGLE_P_LOW = 3.6
+K_ANGLE_P_HIGH = 2.6
+K_ANGLE_D_LOW = 2.2
+K_ANGLE_D_HIGH = 2.8
+ANGLE_DEADBAND_DEG_LOW = 0.20
+ANGLE_DEADBAND_DEG_HIGH = 0.55
+RATE_SP_MAX_DPS_LOW = 24.0
+RATE_SP_MAX_DPS_HIGH = 16.0
+RATE_SP_SLEW_DPS2_LOW = 70.0
+RATE_SP_SLEW_DPS2_HIGH = 48.0
 
 # Inner loop (rate PID -> correction percent), low->high throttle
-KP_RATE_LOW = 0.018
-KP_RATE_HIGH = 0.011
-KI_RATE_LOW = 0.0062
-KI_RATE_HIGH = 0.0020
-KD_RATE_LOW = 0.0300
-KD_RATE_HIGH = 0.0235
-I_TERM_LIM_PCT = 0.25
-RATE_D_FILTER_ALPHA_LOW = 0.68
-RATE_D_FILTER_ALPHA_HIGH = 0.58
-GYRO_RATE_LPF_ALPHA_LOW = 0.24
-GYRO_RATE_LPF_ALPHA_HIGH = 0.12
-MAX_D_TERM_PCT = 0.4
-MAX_CORRECTION_PCT_LOW = 1.1
-MAX_CORRECTION_PCT_HIGH = 0.7
+KP_RATE_LOW = 0.011
+KP_RATE_HIGH = 0.007
+KI_RATE_LOW = 0.0012
+KI_RATE_HIGH = 0.0008
+KD_RATE_LOW = 0.0060
+KD_RATE_HIGH = 0.0040
+I_TERM_LIM_PCT = 0.20
+RATE_D_FILTER_ALPHA_LOW = 0.35
+RATE_D_FILTER_ALPHA_HIGH = 0.28
+GYRO_RATE_LPF_ALPHA_LOW = 0.18
+GYRO_RATE_LPF_ALPHA_HIGH = 0.09
+MAX_D_TERM_PCT = 0.20
+MAX_CORRECTION_PCT_LOW = 1.80
+MAX_CORRECTION_PCT_HIGH = 1.20
+
+# Hard recovery mode for large disturbances: prioritize braking over angle drive.
+RECOVERY_ANGLE_DEG = 6.0
+RECOVERY_RATE_DPS = 40.0
+RECOVERY_HOLD_TIME_S = 0.20
+RECOVERY_P_MULT = 0.78
+RECOVERY_D_BOOST = 1.8
+RECOVERY_SP_CAP_MULT = 0.85
+RECOVERY_U_CAP_MULT = 1.45
+
+# Disturbance override: aggressively brake large rate spikes.
+DISTURB_ANGLE_DEG = 14.0
+DISTURB_RATE_DPS = 90.0
+DISTURB_HOLD_TIME_S = 0.12
+DISTURB_DAMP_GAIN = 0.010
+DISTURB_U_CAP_PCT = 1.40
+
+# One-shot zero-cross damping boost to kill follow-up rings.
+ZERO_X_ANGLE_MULT = 1.3
+ZERO_X_RATE_MULT = 2.0
+ZERO_X_D_BOOST = 1.6
+ZERO_X_SP_CAP_MULT = 0.70
+ZERO_X_BRAKE_TIME_S = 0.10
+
+# Short post-cross ring-kill mode to suppress small follow-up oscillations.
+RING_KILL_TIME_S = 0.16
+RING_KILL_P_MULT = 0.60
+RING_KILL_D_BOOST = 2.0
+RING_KILL_SP_CAP_MULT = 0.65
+RING_KILL_U_CAP_MULT = 0.72
+RING_KILL_I_LEAK = 0.85
 
 # Near-level output hold-zone to suppress audible high-throttle dithering.
-U_HOLD_ZONE_PCT_LOW = 0.012
-U_HOLD_ZONE_PCT_HIGH = 0.07
-HOLD_ANGLE_ENTER_DEG_LOW = 0.10
-HOLD_ANGLE_ENTER_DEG_HIGH = 0.40
-HOLD_RATE_ENTER_DPS_LOW = 0.5
-HOLD_RATE_ENTER_DPS_HIGH = 1.8
-HOLD_ENTER_TIME_S = 0.04
+U_HOLD_ZONE_PCT_LOW = 0.03
+U_HOLD_ZONE_PCT_HIGH = 0.08
+HOLD_ANGLE_ENTER_DEG_LOW = 0.15
+HOLD_ANGLE_ENTER_DEG_HIGH = 0.35
+HOLD_RATE_ENTER_DPS_LOW = 0.9
+HOLD_RATE_ENTER_DPS_HIGH = 2.0
+HOLD_ENTER_TIME_S = 0.14
 HOLD_ANGLE_EXIT_MULT = 1.015
 HOLD_RATE_EXIT_MULT = 1.015
+
+# Slow angle-bias trim to cancel persistent static lean from frame/motor asymmetry.
+LEVEL_BIAS_KI = 0.080
+LEVEL_BIAS_LIM_PCT = 2.00
+LEVEL_BIAS_ACTIVE_RATE_DPS = 22.0
+LEVEL_BIAS_ACTIVE_ANGLE_DEG = 30.0
+LEVEL_BIAS_LEAK = 0.9995
+ANGLE_FORCE_MIN_DEG = 1.2
+ANGLE_FORCE_MIN_U_PCT = 0.10
 
 # Complementary filter and gyro scaling
 COMP_ALPHA_ACCEL = 0.0045
@@ -241,6 +286,7 @@ if __name__ == "__main__":
     print("=== Roll-Only Bench Stabilizer (2-loop: angle->rate PID) ===")
     print("SAFETY: REMOVE PROPS / SECURE THE FRAME.")
     print(f"HARD CAP = {MAX_THROTTLE_PCT}% | RUN_TIME = {RUN_TIME_S}s")
+    print(f"Control headroom reserve = {CONTROL_HEADROOM_PCT:.1f}%")
 
     imu = qwiic_icm20948.QwiicIcm20948()
     if (not imu.connected) or (not imu.begin()):
@@ -255,6 +301,10 @@ if __name__ == "__main__":
     except Exception:
         pass
     target_base_pct = clamp(target_base_pct, 0.0, MAX_THROTTLE_PCT)
+    target_base_cap = max(0.0, MAX_THROTTLE_PCT - CONTROL_HEADROOM_PCT)
+    if target_base_pct > target_base_cap:
+        print(f"Base throttle limited to {target_base_cap:.1f}% to preserve control headroom.")
+        target_base_pct = target_base_cap
 
     dt = 1.0 / float(LOOP_HZ)
 
@@ -297,8 +347,16 @@ if __name__ == "__main__":
             roll_est = 0.0
             gyro_rate_f = 0.0
             i_term = 0.0
+            u_bias = 0.0
             d_f = 0.0
             prev_rate_err = 0.0
+            prev_gyro_rate_f = 0.0
+            prev_rate_sp = 0.0
+            prev_angle_err = 0.0
+            cross_brake_timer_s = 0.0
+            ring_kill_timer_s = 0.0
+            recovery_timer_s = 0.0
+            disturb_timer_s = 0.0
             hold_timer_s = 0.0
             hold_active = False
 
@@ -351,10 +409,14 @@ if __name__ == "__main__":
                                 1.0,
                             )
                             k_angle_p = K_ANGLE_P_LOW + (K_ANGLE_P_HIGH - K_ANGLE_P_LOW) * thr_w
+                            k_angle_d = K_ANGLE_D_LOW + (K_ANGLE_D_HIGH - K_ANGLE_D_LOW) * thr_w
                             angle_deadband_deg = ANGLE_DEADBAND_DEG_LOW + (
                                 ANGLE_DEADBAND_DEG_HIGH - ANGLE_DEADBAND_DEG_LOW
                             ) * thr_w
                             rate_sp_max_dps = RATE_SP_MAX_DPS_LOW + (RATE_SP_MAX_DPS_HIGH - RATE_SP_MAX_DPS_LOW) * thr_w
+                            rate_sp_slew_dps2 = RATE_SP_SLEW_DPS2_LOW + (
+                                RATE_SP_SLEW_DPS2_HIGH - RATE_SP_SLEW_DPS2_LOW
+                            ) * thr_w
                             kp_rate = KP_RATE_LOW + (KP_RATE_HIGH - KP_RATE_LOW) * thr_w
                             ki_rate = KI_RATE_LOW + (KI_RATE_HIGH - KI_RATE_LOW) * thr_w
                             kd_rate = KD_RATE_LOW + (KD_RATE_HIGH - KD_RATE_LOW) * thr_w
@@ -401,14 +463,99 @@ if __name__ == "__main__":
                                 if abs(angle_err) < angle_deadband_deg:
                                     angle_err = 0.0
 
-                                rate_sp = clamp(
-                                    k_angle_p * angle_err,
-                                    -rate_sp_max_dps,
-                                    rate_sp_max_dps,
+                                # Slow trim to remove persistent static lean that the rate loop alone
+                                # may not overcome at high base throttle.
+                                u_bias *= LEVEL_BIAS_LEAK
+                                if (
+                                    abs(gyro_rate_f) < LEVEL_BIAS_ACTIVE_RATE_DPS
+                                    and abs(roll_est) < LEVEL_BIAS_ACTIVE_ANGLE_DEG
+                                ):
+                                    u_bias += LEVEL_BIAS_KI * angle_err * dt
+                                    u_bias = clamp(u_bias, -LEVEL_BIAS_LIM_PCT, LEVEL_BIAS_LIM_PCT)
+
+                                crossed_zero = (
+                                    (angle_err * prev_angle_err) < 0.0
+                                    and abs(prev_angle_err) > (ZERO_X_ANGLE_MULT * angle_deadband_deg)
+                                    and abs(gyro_rate_f) > (ZERO_X_RATE_MULT * hold_rate_enter_dps)
                                 )
+                                if crossed_zero:
+                                    cross_brake_timer_s = ZERO_X_BRAKE_TIME_S
+                                    ring_kill_timer_s = RING_KILL_TIME_S
+                                    i_term *= 0.30
+
+                                k_angle_p_eff = k_angle_p
+                                k_angle_d_eff = k_angle_d
+                                rate_sp_max_eff = rate_sp_max_dps
+                                u_cap_eff = max_correction_pct
+
+                                # "Moving away" means roll magnitude is increasing, not returning toward level.
+                                moving_away_from_level = (angle_err * gyro_rate_f) < 0.0
+
+                                recovery_trigger = (
+                                    abs(gyro_rate_f) > RECOVERY_RATE_DPS
+                                    or (
+                                        abs(roll_est) > RECOVERY_ANGLE_DEG
+                                        and moving_away_from_level
+                                    )
+                                )
+                                if recovery_trigger and (recovery_timer_s <= 0.0):
+                                    recovery_timer_s = RECOVERY_HOLD_TIME_S
+                                if recovery_timer_s > 0.0:
+                                    k_angle_p_eff *= RECOVERY_P_MULT
+                                    k_angle_d_eff *= RECOVERY_D_BOOST
+                                    rate_sp_max_eff *= RECOVERY_SP_CAP_MULT
+                                    u_cap_eff *= RECOVERY_U_CAP_MULT
+                                    i_term *= 0.78
+                                    recovery_timer_s = max(0.0, recovery_timer_s - dt)
+
+                                disturb_trigger = (
+                                    abs(gyro_rate_f) > DISTURB_RATE_DPS
+                                    or (
+                                        abs(roll_est) > DISTURB_ANGLE_DEG
+                                        and moving_away_from_level
+                                        and abs(gyro_rate_f) > (2.0 * hold_rate_enter_dps)
+                                    )
+                                )
+                                if disturb_trigger and (disturb_timer_s <= 0.0):
+                                    disturb_timer_s = DISTURB_HOLD_TIME_S
+                                disturb_active = disturb_timer_s > 0.0
+                                if disturb_active:
+                                    disturb_timer_s = max(0.0, disturb_timer_s - dt)
+
+                                if cross_brake_timer_s > 0.0:
+                                    k_angle_d_eff *= ZERO_X_D_BOOST
+                                    rate_sp_max_eff *= ZERO_X_SP_CAP_MULT
+                                    i_term *= 0.90
+                                    cross_brake_timer_s = max(0.0, cross_brake_timer_s - dt)
+
+                                if ring_kill_timer_s > 0.0:
+                                    k_angle_p_eff *= RING_KILL_P_MULT
+                                    k_angle_d_eff *= RING_KILL_D_BOOST
+                                    rate_sp_max_eff *= RING_KILL_SP_CAP_MULT
+                                    u_cap_eff *= RING_KILL_U_CAP_MULT
+                                    i_term *= RING_KILL_I_LEAK
+                                    ring_kill_timer_s = max(0.0, ring_kill_timer_s - dt)
+
+                                # Add outer-loop rate damping and slew-limit to suppress multi-ring behavior.
+                                rate_sp_target = clamp(
+                                    (k_angle_p_eff * angle_err) - (k_angle_d_eff * gyro_rate_f),
+                                    -rate_sp_max_eff,
+                                    rate_sp_max_eff,
+                                )
+                                rate_sp_step = rate_sp_slew_dps2 * dt
+                                rate_sp = clamp(
+                                    rate_sp_target,
+                                    prev_rate_sp - rate_sp_step,
+                                    prev_rate_sp + rate_sp_step,
+                                )
+                                prev_rate_sp = rate_sp
+
+                                prev_angle_err = angle_err
 
                                 rate_err = rate_sp - gyro_rate_f
-                                d_raw = (rate_err - prev_rate_err) / dt
+                                # Derivative on measurement to avoid setpoint-kick sign flips.
+                                d_raw = -((gyro_rate_f - prev_gyro_rate_f) / dt)
+                                prev_gyro_rate_f = gyro_rate_f
                                 prev_rate_err = rate_err
                                 d_f = (1.0 - rate_d_alpha) * d_f + rate_d_alpha * d_raw
 
@@ -421,10 +568,34 @@ if __name__ == "__main__":
                                 if not pushing_into_sat:
                                     i_term += ki_rate * rate_err * dt
                                     i_term = clamp(i_term, -I_TERM_LIM_PCT, I_TERM_LIM_PCT)
+                                    if abs(angle_err) < (2.5 * angle_deadband_deg):
+                                        i_term *= 0.990
 
                                 u = p_term + i_term + d_term
                                 u *= pid_blend
-                                u = clamp(u, -max_correction_pct, max_correction_pct)
+                                u += (u_bias * pid_blend)
+                                u = clamp(u, -u_cap_eff, u_cap_eff)
+
+                                # Guarantee a minimum corrective authority for large lean errors.
+                                if abs(angle_err) > ANGLE_FORCE_MIN_DEG:
+                                    min_u = ANGLE_FORCE_MIN_U_PCT * pid_blend
+                                    if abs(u) < min_u:
+                                        u = math.copysign(min_u, angle_err)
+
+                                if disturb_active:
+                                    # Add rate braking on top of angle correction, instead of replacing it.
+                                    # This avoids "parking" at large residual angles after a hard shove.
+                                    i_term *= 0.80
+                                    u_brake = clamp(
+                                        -DISTURB_DAMP_GAIN * gyro_rate_f,
+                                        -DISTURB_U_CAP_PCT,
+                                        DISTURB_U_CAP_PCT,
+                                    )
+                                    u = clamp(
+                                        u + u_brake,
+                                        -DISTURB_U_CAP_PCT,
+                                        DISTURB_U_CAP_PCT,
+                                    )
 
                                 # Hysteretic hold mode to eliminate micro-jitter near level.
                                 in_hold_window = (
@@ -449,6 +620,13 @@ if __name__ == "__main__":
                                         u = 0.0
                                         i_term *= 0.98
                                         prev_rate_err = 0.0
+                                        prev_gyro_rate_f = gyro_rate_f
+                                        prev_rate_sp = 0.0
+                                        prev_angle_err = 0.0
+                                        cross_brake_timer_s = 0.0
+                                        ring_kill_timer_s = 0.0
+                                        recovery_timer_s = 0.0
+                                        disturb_timer_s = 0.0
                                         d_f = 0.0
 
                                 if (not hold_active) and (abs(angle_err) < (1.5 * angle_deadband_deg)) and (abs(u) < u_hold_zone_pct):
@@ -458,8 +636,16 @@ if __name__ == "__main__":
                                 rate_err = 0.0
                                 u = 0.0
                                 i_term = 0.0
+                                u_bias = 0.0
                                 d_f = 0.0
                                 prev_rate_err = 0.0
+                                prev_gyro_rate_f = 0.0
+                                prev_rate_sp = 0.0
+                                prev_angle_err = 0.0
+                                cross_brake_timer_s = 0.0
+                                ring_kill_timer_s = 0.0
+                                recovery_timer_s = 0.0
+                                disturb_timer_s = 0.0
                                 hold_timer_s = 0.0
                                 hold_active = False
 
@@ -491,7 +677,7 @@ if __name__ == "__main__":
 
                                 print(
                                     f"[{state:>8}] r={roll_est:+6.2f} deg | rr={gyro_rate_f:+6.1f} dps | "
-                                    f"rsp={rate_sp:+6.1f} | u={u:+5.2f}% | "
+                                    f"rsp={rate_sp:+6.1f} | u={u:+5.2f}% | ub={u_bias:+5.2f}% | "
                                     f"A={cmd_A:4.1f}% B={cmd_B:4.1f}%"
                                 )
                                 last_print = now
