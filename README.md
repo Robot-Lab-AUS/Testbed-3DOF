@@ -1,6 +1,7 @@
 this project is valled the tesseract
 
 ** to configure git
+
 git config --global user.email "bara.emran@gmail.com"
 
 git config --global user.name "bara Emran"
