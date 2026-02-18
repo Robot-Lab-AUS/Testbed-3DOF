@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+Roll-Only Bench Stabilizer (PCA9685 + ICM-20948)
+- Outer loop: roll angle P -> roll-rate setpoint
+- Inner loop: roll-rate PID -> motor differential command
+- Complementary angle estimate (accel + gyro)
+- Startup ramp + settle + PID blend-in
+- Safety throttle cap + auto-stop
+"""
+
+import time
+import math
+import sys
+from smbus2 import SMBus
+import qwiic_icm20948
+
+# =========================
+# PCA9685 @ 0x40 (Auto pHAT servo controller)
+# =========================
+PCA9685_ADDR = 0x40
+
+MODE1 = 0x00
+MODE2 = 0x01
+PRESCALE = 0xFE
+LED0_ON_L = 0x06
+
+MODE1_SLEEP = 0x10
+MODE1_RESTART = 0x80
+MODE1_AI = 0x20
+MODE2_OUTDRV = 0x04
+
+OSC_CLOCK_HZ = 25_000_000
+
+
+def write8(bus, reg, val):
+    bus.write_byte_data(PCA9685_ADDR, reg, val & 0xFF)
+
+
+def read8(bus, reg):
+    return bus.read_byte_data(PCA9685_ADDR, reg)
+
+
+def init_pca9685(bus):
+    write8(bus, MODE2, MODE2_OUTDRV)
+    write8(bus, MODE1, MODE1_AI)
+    time.sleep(0.01)
+
+
+def set_pwm_freq(bus, freq_hz):
+    prescale = int(round(OSC_CLOCK_HZ / (4096.0 * float(freq_hz)) - 1.0))
+    prescale = max(3, min(255, prescale))
+
+    old_mode1 = read8(bus, MODE1)
+    write8(bus, MODE1, (old_mode1 & ~MODE1_RESTART) | MODE1_SLEEP)
+    write8(bus, PRESCALE, prescale)
+    write8(bus, MODE1, old_mode1 & ~MODE1_SLEEP)
+    time.sleep(0.005)
+    write8(bus, MODE1, (old_mode1 & ~MODE1_SLEEP) | MODE1_RESTART)
+    time.sleep(0.01)
+
+
+def set_pwm_counts(bus, channel, on_count, off_count):
+    base = LED0_ON_L + 4 * int(channel)
+    write8(bus, base + 0, on_count & 0xFF)
+    write8(bus, base + 1, (on_count >> 8) & 0x0F)
+    write8(bus, base + 2, off_count & 0xFF)
+    write8(bus, base + 3, (off_count >> 8) & 0x0F)
+
+
+def set_pulse_us(bus, channel, pulse_us, freq_hz):
+    period_us = 1_000_000.0 / float(freq_hz)
+    pulse_us = max(0.0, min(float(pulse_us), period_us))
+    counts = int(round((pulse_us / period_us) * 4096.0))
+    counts = max(0, min(4095, counts))
+    set_pwm_counts(bus, channel, 0, counts)
+
+
+def pct_to_us(pct, min_us, max_us):
+    pct = max(0.0, min(100.0, float(pct)))
+    return min_us + (pct / 100.0) * (max_us - min_us)
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+# =========================
+# IMU helpers
+# =========================
+def accel_to_pitch_roll(ax, ay, az):
+    roll = math.degrees(math.atan2(ay, az))
+    pitch = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+    return pitch, roll
+
+
+def imu_read_accel_gyro(imu):
+    imu.getAgmt()
+    ax = float(imu.axRaw)
+    ay = float(imu.ayRaw)
+    az = float(imu.azRaw)
+    gx = float(imu.gxRaw)
+    gy = float(imu.gyRaw)
+    gz = float(imu.gzRaw)
+    return ax, ay, az, gx, gy, gz
+
+
+# =========================
+# USER CONFIG (SAFE)
+# =========================
+# TUNING HISTORY - BEST VERSIONS TO REVERT TO
+# v1 (2025-02-18): Single-axis lock focus
+# KP_RATE: 0.038/0.030 | KI_RATE: 0.0035/0.0012 | KD_RATE: 0.0110/0.0090
+# HOLD: enter 0.55°/3.0dps | exit 1.2x | zone 0.25% | D_FILTER: 0.32/0.22 | COMP: 0.05
+#
+# v3 (2025-02-18): Pushed harder, amazing results
+# KP_RATE: 0.032/0.025 | KI_RATE: 0.0055/0.0018 | KD_RATE: 0.0125/0.0100
+# HOLD: enter 0.35°/2.0dps | exit 1.1x | zone 0.12% | D_FILTER: 0.40/0.30 | COMP: 0.02
+#
+# v4 (2025-02-18): Fast settling 1-4 rings - CRAZY GOOD
+# KP_RATE: 0.030/0.023 | KI_RATE: 0.0048/0.0015 | KD_RATE: 0.0155/0.0125
+# HOLD: enter 0.30°/1.5dps | exit 1.1x | zone 0.08% | D_FILTER: 0.45/0.35
+# GYRO_LPF: 0.14/0.07 | COMP: 0.015 | Pushing even more now!
+#
+# v5 (2025-02-18): EXTREME damping - lightning fast
+# KP_RATE: 0.028/0.021 | KI_RATE: 0.0050/0.0016 | KD_RATE: 0.0180/0.0145
+# HOLD: enter 0.25°/1.2dps | exit 1.08x | zone 0.05% | D_FILTER: 0.50/0.40
+# GYRO_LPF: 0.16/0.08 | COMP: 0.010 | MOREEEEEE pushing!!!
+#
+# v6 (2025-02-18 FINAL): ABSOLUTE NUCLEAR - Real IRL improvements confirmed!
+# KP_RATE: 0.025/0.018 | KI_RATE: 0.0052/0.0017 | KD_RATE: 0.0220/0.0175
+# RATE_D_FILTER: 0.55/0.45 | GYRO_LPF: 0.18/0.09 | COMP: 0.007
+# HOLD: 0.20°/1.0dps/1.05x/0.03% | ANGLE_P: 5.0/3.8 | DEADBAND: 0.7°/1.8°
+# MAX_CORRECTION: 1.3%/0.8% | MAX_D: 0.5 | STARTUP: 1.0s/0.6s | SLEW: 5.0%/55%
+#
+# v7 (2025-02-18 EDGE): ABSOLUTE NUCLEAR MAX - Testing wall
+# KP_RATE: 0.022/0.015 | KI_RATE: 0.0055/0.0018 | KD_RATE: 0.0260/0.0205
+# HOLD: 0.15°/0.8dps/1.03x/0.02% | ANGLE_P: 5.5/4.2 | DEADBAND: 0.6°/1.6°
+# RATE_D_FILTER: 0.60/0.50 | GYRO_LPF: 0.20/0.10 | COMP: 0.005
+#
+# v8 (2025-02-18 ZERO OSCILLATION): FINAL PUSH for theoretical ideal
+# KP_RATE: 0.020/0.013 | KI_RATE: 0.0058/0.0019 | KD_RATE: 0.0280/0.0220
+# HOLD: 0.12°/0.6dps/1.02x/0.015% | ANGLE_P: 6.0/4.5 | DEADBAND: 0.5°/1.4°
+# RATE_D_FILTER: 0.65/0.55 | GYRO_LPF: 0.22/0.11 | COMP: 0.004 | SLEW: 7.0%/70%
+#
+# v9 (2025-02-18 SCARY GOOD): ABSOLUTE FINAL LIMIT - Last mile push
+# KP_RATE: 0.018/0.011 | KI_RATE: 0.0062/0.0020 | KD_RATE: 0.0300/0.0235
+# HOLD: 0.10°/0.5dps/1.015x/0.012% | ANGLE_P: 6.5/4.8 | DEADBAND: 0.45°/1.25°
+# RATE_D_FILTER: 0.68/0.58 | GYRO_LPF: 0.24/0.12 | COMP: 0.0045 | SLEW: 8.0%/75%
+
+FREQ = 50
+CHANNELS = [0, 1, 2, 3]
+M_FL, M_FR, M_RR, M_RL = 0, 1, 2, 3
+
+MIN_US = 1000
+MAX_US = 2000
+
+ARM_TIME_S = 3.0
+RUN_TIME_S = 100.0
+
+MAX_THROTTLE_PCT = 20.0
+DEFAULT_BASE_PCT = 7.0
+
+# Throttle-aware scheduling for low-jitter hold at higher base speed.
+# At higher throttle, reduce loop aggressiveness and increase filtering/deadband.
+SCHED_THR_LOW_PCT = 10.0
+SCHED_THR_HIGH_PCT = 20.0
+
+# Outer loop (angle -> rate setpoint), low->high throttle
+K_ANGLE_P_LOW = 6.5
+K_ANGLE_P_HIGH = 4.8
+ANGLE_DEADBAND_DEG_LOW = 0.45
+ANGLE_DEADBAND_DEG_HIGH = 1.25
+RATE_SP_MAX_DPS_LOW = 72.0
+RATE_SP_MAX_DPS_HIGH = 46.0
+
+# Inner loop (rate PID -> correction percent), low->high throttle
+KP_RATE_LOW = 0.018
+KP_RATE_HIGH = 0.011
+KI_RATE_LOW = 0.0062
+KI_RATE_HIGH = 0.0020
+KD_RATE_LOW = 0.0300
+KD_RATE_HIGH = 0.0235
+I_TERM_LIM_PCT = 0.25
+RATE_D_FILTER_ALPHA_LOW = 0.68
+RATE_D_FILTER_ALPHA_HIGH = 0.58
+GYRO_RATE_LPF_ALPHA_LOW = 0.24
+GYRO_RATE_LPF_ALPHA_HIGH = 0.12
+MAX_D_TERM_PCT = 0.4
+MAX_CORRECTION_PCT_LOW = 1.1
+MAX_CORRECTION_PCT_HIGH = 0.7
+
+# Near-level output hold-zone to suppress audible high-throttle dithering.
+U_HOLD_ZONE_PCT_LOW = 0.012
+U_HOLD_ZONE_PCT_HIGH = 0.07
+HOLD_ANGLE_ENTER_DEG_LOW = 0.10
+HOLD_ANGLE_ENTER_DEG_HIGH = 0.40
+HOLD_RATE_ENTER_DPS_LOW = 0.5
+HOLD_RATE_ENTER_DPS_HIGH = 1.8
+HOLD_ENTER_TIME_S = 0.04
+HOLD_ANGLE_EXIT_MULT = 1.015
+HOLD_RATE_EXIT_MULT = 1.015
+
+# Complementary filter and gyro scaling
+COMP_ALPHA_ACCEL = 0.0045
+GYRO_LSB_PER_DPS = 131.0
+GYRO_ROLL_AXIS = "x"
+GYRO_ROLL_SIGN = +1.0
+
+# Polarity controls
+SIGN_ROLL = +1.0
+CONTROL_MIX_SIGN = +1.0
+
+# Startup strategy
+NOMINAL_SETTLE_S = 0.7
+PID_BLEND_IN_S = 0.4
+
+# Command smoothness
+BASE_RAMP_PCT_PER_S = 8.0
+CMD_SLEW_PCT_PER_S = 75.0
+
+# Runtime
+LOOP_HZ = 100
+PRINT_EVERY_S = 0.25
+MAX_IMU_ERRORS_BEFORE_STOP = 10
+
+
+def stop_all(bus):
+    for ch in CHANNELS:
+        set_pulse_us(bus, ch, MIN_US, FREQ)
+
+
+def select_roll_gyro_raw(gx, gy, gz):
+    if GYRO_ROLL_AXIS == "x":
+        return gx
+    if GYRO_ROLL_AXIS == "y":
+        return gy
+    return gz
+
+
+if __name__ == "__main__":
+    print("=== Roll-Only Bench Stabilizer (2-loop: angle->rate PID) ===")
+    print("SAFETY: REMOVE PROPS / SECURE THE FRAME.")
+    print(f"HARD CAP = {MAX_THROTTLE_PCT}% | RUN_TIME = {RUN_TIME_S}s")
+
+    imu = qwiic_icm20948.QwiicIcm20948()
+    if (not imu.connected) or (not imu.begin()):
+        print("IMU not detected or begin() failed.")
+        sys.exit(1)
+
+    target_base_pct = DEFAULT_BASE_PCT
+    try:
+        s = input(f"Base throttle (0..{MAX_THROTTLE_PCT}) [{DEFAULT_BASE_PCT}]: ").strip()
+        if s:
+            target_base_pct = float(s)
+    except Exception:
+        pass
+    target_base_pct = clamp(target_base_pct, 0.0, MAX_THROTTLE_PCT)
+
+    dt = 1.0 / float(LOOP_HZ)
+
+    try:
+        with SMBus(1) as bus:
+            init_pca9685(bus)
+            set_pwm_freq(bus, FREQ)
+
+            print(f"Arming {ARM_TIME_S:.1f}s at MIN...")
+            stop_all(bus)
+            time.sleep(ARM_TIME_S)
+
+            print("Calibration: hold the drone STILL and LEVEL for 2 seconds...")
+            t0 = time.time()
+            r_sum = 0.0
+            g_sum = 0.0
+            n = 0
+
+            while time.time() - t0 < 2.0:
+                try:
+                    if imu.dataReady():
+                        ax, ay, az, gx, gy, gz = imu_read_accel_gyro(imu)
+                        _, roll_acc = accel_to_pitch_roll(ax, ay, az)
+                        r_sum += (roll_acc * SIGN_ROLL)
+                        g_sum += select_roll_gyro_raw(gx, gy, gz)
+                        n += 1
+                except OSError:
+                    pass
+                time.sleep(0.01)
+
+            if n == 0:
+                print("Calibration failed (no IMU samples). Stopping.")
+                stop_all(bus)
+                sys.exit(1)
+
+            roll0 = r_sum / n
+            gyro_bias_raw = g_sum / n
+            print(f"Cal done. roll0={roll0:+.2f} deg | gyro_bias_raw={gyro_bias_raw:+.1f} LSB")
+
+            roll_est = 0.0
+            gyro_rate_f = 0.0
+            i_term = 0.0
+            d_f = 0.0
+            prev_rate_err = 0.0
+            hold_timer_s = 0.0
+            hold_active = False
+
+            current_base_pct = 0.0
+            prev_cmd_A = 0.0
+            prev_cmd_B = 0.0
+
+            last_print = 0.0
+            imu_err_count = 0
+            start_run = time.time()
+            nominal_reached_t = None
+
+            print("Running. Ramp -> settle at nominal -> gradual PID blend-in.")
+
+            try:
+                while True:
+                    loop_start = time.time()
+                    now = loop_start
+
+                    if (now - start_run) > RUN_TIME_S:
+                        print("Run time exceeded. Stopping motors.")
+                        break
+
+                    try:
+                        if imu.dataReady():
+                            ax, ay, az, gx, gy, gz = imu_read_accel_gyro(imu)
+                            _, roll_acc = accel_to_pitch_roll(ax, ay, az)
+                            roll_acc = (roll_acc * SIGN_ROLL) - roll0
+
+                            gyro_raw = select_roll_gyro_raw(gx, gy, gz)
+                            gyro_roll_dps = (
+                                ((gyro_raw - gyro_bias_raw) / GYRO_LSB_PER_DPS)
+                                * GYRO_ROLL_SIGN
+                                * SIGN_ROLL
+                            )
+
+                            roll_pred = roll_est + gyro_roll_dps * dt
+                            roll_est = (1.0 - COMP_ALPHA_ACCEL) * roll_pred + COMP_ALPHA_ACCEL * roll_acc
+
+                            base_step = BASE_RAMP_PCT_PER_S * dt
+                            if current_base_pct < target_base_pct:
+                                current_base_pct = min(current_base_pct + base_step, target_base_pct)
+                            else:
+                                current_base_pct = max(current_base_pct - base_step, target_base_pct)
+
+                            # Throttle-aware controller scheduling (blend low->high profiles)
+                            thr_w = clamp(
+                                (current_base_pct - SCHED_THR_LOW_PCT) / max(1e-6, (SCHED_THR_HIGH_PCT - SCHED_THR_LOW_PCT)),
+                                0.0,
+                                1.0,
+                            )
+                            k_angle_p = K_ANGLE_P_LOW + (K_ANGLE_P_HIGH - K_ANGLE_P_LOW) * thr_w
+                            angle_deadband_deg = ANGLE_DEADBAND_DEG_LOW + (
+                                ANGLE_DEADBAND_DEG_HIGH - ANGLE_DEADBAND_DEG_LOW
+                            ) * thr_w
+                            rate_sp_max_dps = RATE_SP_MAX_DPS_LOW + (RATE_SP_MAX_DPS_HIGH - RATE_SP_MAX_DPS_LOW) * thr_w
+                            kp_rate = KP_RATE_LOW + (KP_RATE_HIGH - KP_RATE_LOW) * thr_w
+                            ki_rate = KI_RATE_LOW + (KI_RATE_HIGH - KI_RATE_LOW) * thr_w
+                            kd_rate = KD_RATE_LOW + (KD_RATE_HIGH - KD_RATE_LOW) * thr_w
+                            rate_d_alpha = RATE_D_FILTER_ALPHA_LOW + (
+                                RATE_D_FILTER_ALPHA_HIGH - RATE_D_FILTER_ALPHA_LOW
+                            ) * thr_w
+                            gyro_lpf_alpha = GYRO_RATE_LPF_ALPHA_LOW + (
+                                GYRO_RATE_LPF_ALPHA_HIGH - GYRO_RATE_LPF_ALPHA_LOW
+                            ) * thr_w
+                            max_correction_pct = MAX_CORRECTION_PCT_LOW + (
+                                MAX_CORRECTION_PCT_HIGH - MAX_CORRECTION_PCT_LOW
+                            ) * thr_w
+                            u_hold_zone_pct = U_HOLD_ZONE_PCT_LOW + (
+                                U_HOLD_ZONE_PCT_HIGH - U_HOLD_ZONE_PCT_LOW
+                            ) * thr_w
+                            hold_angle_enter_deg = HOLD_ANGLE_ENTER_DEG_LOW + (
+                                HOLD_ANGLE_ENTER_DEG_HIGH - HOLD_ANGLE_ENTER_DEG_LOW
+                            ) * thr_w
+                            hold_rate_enter_dps = HOLD_RATE_ENTER_DPS_LOW + (
+                                HOLD_RATE_ENTER_DPS_HIGH - HOLD_RATE_ENTER_DPS_LOW
+                            ) * thr_w
+
+                            gyro_rate_f = (1.0 - gyro_lpf_alpha) * gyro_rate_f + gyro_lpf_alpha * gyro_roll_dps
+
+                            if (nominal_reached_t is None) and (abs(current_base_pct - target_base_pct) < 1e-6):
+                                nominal_reached_t = now
+
+                            pid_blend = 0.0
+                            if nominal_reached_t is not None:
+                                t_since_nominal = now - nominal_reached_t
+                                if t_since_nominal >= NOMINAL_SETTLE_S:
+                                    pid_blend = clamp(
+                                        (t_since_nominal - NOMINAL_SETTLE_S) / PID_BLEND_IN_S,
+                                        0.0,
+                                        1.0,
+                                    )
+
+                            pid_enabled = pid_blend > 0.0
+                            if pid_enabled:
+                                pid_blend = max(pid_blend, 0.12)
+
+                            if pid_enabled:
+                                angle_err = -roll_est
+                                if abs(angle_err) < angle_deadband_deg:
+                                    angle_err = 0.0
+
+                                rate_sp = clamp(
+                                    k_angle_p * angle_err,
+                                    -rate_sp_max_dps,
+                                    rate_sp_max_dps,
+                                )
+
+                                rate_err = rate_sp - gyro_rate_f
+                                d_raw = (rate_err - prev_rate_err) / dt
+                                prev_rate_err = rate_err
+                                d_f = (1.0 - rate_d_alpha) * d_f + rate_d_alpha * d_raw
+
+                                p_term = kp_rate * rate_err
+                                d_term = clamp(kd_rate * d_f, -MAX_D_TERM_PCT, MAX_D_TERM_PCT)
+                                u_pre = p_term + i_term + d_term
+
+                                sat_limit = I_TERM_LIM_PCT
+                                pushing_into_sat = (abs(u_pre) >= sat_limit) and ((u_pre * rate_err) > 0.0)
+                                if not pushing_into_sat:
+                                    i_term += ki_rate * rate_err * dt
+                                    i_term = clamp(i_term, -I_TERM_LIM_PCT, I_TERM_LIM_PCT)
+
+                                u = p_term + i_term + d_term
+                                u *= pid_blend
+                                u = clamp(u, -max_correction_pct, max_correction_pct)
+
+                                # Hysteretic hold mode to eliminate micro-jitter near level.
+                                in_hold_window = (
+                                    abs(angle_err) < hold_angle_enter_deg
+                                    and abs(gyro_rate_f) < hold_rate_enter_dps
+                                )
+                                if in_hold_window:
+                                    hold_timer_s += dt
+                                else:
+                                    hold_timer_s = 0.0
+
+                                if not hold_active and hold_timer_s >= HOLD_ENTER_TIME_S:
+                                    hold_active = True
+
+                                if hold_active:
+                                    if (
+                                        abs(angle_err) > (HOLD_ANGLE_EXIT_MULT * hold_angle_enter_deg)
+                                        or abs(gyro_rate_f) > (HOLD_RATE_EXIT_MULT * hold_rate_enter_dps)
+                                    ):
+                                        hold_active = False
+                                    else:
+                                        u = 0.0
+                                        i_term *= 0.98
+                                        prev_rate_err = 0.0
+                                        d_f = 0.0
+
+                                if (not hold_active) and (abs(angle_err) < (1.5 * angle_deadband_deg)) and (abs(u) < u_hold_zone_pct):
+                                    u = 0.0
+                            else:
+                                rate_sp = 0.0
+                                rate_err = 0.0
+                                u = 0.0
+                                i_term = 0.0
+                                d_f = 0.0
+                                prev_rate_err = 0.0
+                                hold_timer_s = 0.0
+                                hold_active = False
+
+                            cmd_A = clamp(current_base_pct + (CONTROL_MIX_SIGN * u), 0.0, MAX_THROTTLE_PCT)
+                            cmd_B = clamp(current_base_pct - (CONTROL_MIX_SIGN * u), 0.0, MAX_THROTTLE_PCT)
+
+                            max_step = CMD_SLEW_PCT_PER_S * dt
+                            cmd_A = clamp(cmd_A, prev_cmd_A - max_step, prev_cmd_A + max_step)
+                            cmd_B = clamp(cmd_B, prev_cmd_B - max_step, prev_cmd_B + max_step)
+                            prev_cmd_A = cmd_A
+                            prev_cmd_B = cmd_B
+
+                            set_pulse_us(bus, M_FL, pct_to_us(cmd_A, MIN_US, MAX_US), FREQ)
+                            set_pulse_us(bus, M_RL, pct_to_us(cmd_A, MIN_US, MAX_US), FREQ)
+                            set_pulse_us(bus, M_FR, pct_to_us(cmd_B, MIN_US, MAX_US), FREQ)
+                            set_pulse_us(bus, M_RR, pct_to_us(cmd_B, MIN_US, MAX_US), FREQ)
+
+                            imu_err_count = 0
+
+                            if (now - last_print) > PRINT_EVERY_S:
+                                if nominal_reached_t is None:
+                                    state = "RAMP"
+                                elif pid_blend <= 0.0:
+                                    state = "SETL"
+                                elif pid_blend < 1.0:
+                                    state = f"BLND{pid_blend:0.2f}"
+                                else:
+                                    state = "PID "
+
+                                print(
+                                    f"[{state:>8}] r={roll_est:+6.2f} deg | rr={gyro_rate_f:+6.1f} dps | "
+                                    f"rsp={rate_sp:+6.1f} | u={u:+5.2f}% | "
+                                    f"A={cmd_A:4.1f}% B={cmd_B:4.1f}%"
+                                )
+                                last_print = now
+
+                    except OSError:
+                        imu_err_count += 1
+                        if imu_err_count >= MAX_IMU_ERRORS_BEFORE_STOP:
+                            print("Too many IMU I2C errors. Stopping motors for safety.")
+                            break
+
+                    elapsed = time.time() - loop_start
+                    sleep_t = dt - elapsed
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+
+            except KeyboardInterrupt:
+                print("\nStopping (Ctrl+C)...")
+            finally:
+                stop_all(bus)
+                time.sleep(0.3)
+                print("Motors set to MIN. Bye.")
+
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
